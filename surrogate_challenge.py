@@ -68,7 +68,7 @@ def fit_surrogate(train_df, feature_names, teacher):
     Features are standardized before boosting, and hyper-parameters are chosen
     by 5-fold cross-validation.
     """
-    # Sample the training rows for the grid search.
+   # Sample the training rows to keep the grid search fast.
     sample = train_df.sample(frac=TUNING_SAMPLE_FRAC, random_state=RANDOM_STATE)
 
 
