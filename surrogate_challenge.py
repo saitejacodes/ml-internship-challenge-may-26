@@ -42,12 +42,7 @@ from xgboost import XGBRegressor
 
 RANDOM_STATE = 42
 PASS_THRESHOLD = 0.95
-
-# Grid search over the surrogate can be slow on the full training set, so we
-# tune on a representative sample of the rows for speed.
-TUNING_SAMPLE_FRAC = 0.5
-
-
+TUNING_SAMPLE_FRAC = 1.0
 def load_frame():
     """Load the dataset as a feature frame plus a target series."""
     data = load_diabetes()
@@ -55,8 +50,6 @@ def load_frame():
     X = pd.DataFrame(data.data, columns=feature_names)
     y = pd.Series(data.target, name="target")
     return X, y, feature_names
-
-
 def fit_teacher(X_train, y_train):
     """Train the black-box forest we later want to approximate."""
     teacher = RandomForestRegressor(
@@ -68,8 +61,6 @@ def fit_teacher(X_train, y_train):
     )
     teacher.fit(X_train.values, y_train.values)
     return teacher
-
-
 def fit_surrogate(train_df, feature_names, teacher):
     """
     Fit and tune the XGBoost surrogate that stands in for the forest.
@@ -77,43 +68,61 @@ def fit_surrogate(train_df, feature_names, teacher):
     Features are standardized before boosting, and hyper-parameters are chosen
     by 5-fold cross-validation.
     """
-    # Sample the training rows to keep the grid search fast.
+   # Sample the training rows to keep the grid search fast.
     sample = train_df.sample(frac=TUNING_SAMPLE_FRAC, random_state=RANDOM_STATE)
 
-    scaler = StandardScaler().fit(sample[feature_names])
-    X = scaler.transform(sample[feature_names])
+
+    scaler_sample = StandardScaler().fit(sample[feature_names])
+    X_sample = scaler_sample.transform(sample[feature_names])
 
     # Note for the model card: which inputs the forest leans on most.
     ranked = np.array(feature_names)[np.argsort(teacher.feature_importances_)]
     print(f"Top forest drivers: {[str(f) for f in ranked[-3:][::-1]]}")
-
-    # Regression target for the surrogate.
-    target = sample["target"].values
-
+    target_sample = teacher.predict(sample[feature_names].values)
     param_grid = {
         "n_estimators": [300, 600],
         "max_depth": [3, 5],
         "learning_rate": [0.03, 0.05, 0.1],
     }
+
     base = XGBRegressor(
         objective="reg:squarederror",
-        # Regularization so individual trees don't chase noise.
-        min_child_weight=12,
+        min_child_weight=3,
+        subsample=1.0,
+        colsample_bytree=1.0,
         random_state=RANDOM_STATE,
         n_jobs=1,
     )
+
     search = GridSearchCV(base, param_grid, scoring="r2", cv=5, n_jobs=-1)
-    search.fit(X, target)
+    search.fit(X_sample, target_sample)
 
     print(f"Best CV score (R^2): {search.best_score_:.4f}")
     print(f"Best params       : {search.best_params_}")
-    return search.best_estimator_, scaler
+    X_full = train_df[feature_names].values
+    target_full = teacher.predict(X_full)
+
+    scaler_full = StandardScaler().fit(X_full)
+    X_full_scaled = scaler_full.transform(X_full)
+
+    best_model = XGBRegressor(
+        objective="reg:squarederror",
+        min_child_weight=3,
+        subsample=1.0,
+        colsample_bytree=1.0,
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+        **search.best_params_,
+    )
+    best_model.fit(X_full_scaled, target_full)
+
+    return best_model, scaler_full
 
 
 def evaluate(teacher, surrogate, scaler, X_test, y_test, feature_names):
     """Report surrogate fidelity to the teacher on the held-out test set."""
     teacher_pred = teacher.predict(X_test.values)
-    surrogate_pred = surrogate.predict(scaler.transform(X_test[feature_names]))
+    surrogate_pred = surrogate.predict(scaler.transform(X_test[feature_names].values))
 
     fidelity_r2 = r2_score(teacher_pred, surrogate_pred)
     fidelity_rmse = mean_squared_error(teacher_pred, surrogate_pred) ** 0.5
@@ -141,7 +150,6 @@ def main():
         X, y, test_size=0.2, random_state=RANDOM_STATE
     )
     teacher = fit_teacher(X_train, y_train)
-
     train_df = X_train.copy()
     train_df["target"] = y_train.values
 
